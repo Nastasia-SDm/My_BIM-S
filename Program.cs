@@ -14,9 +14,9 @@ namespace BimS
     {
         private const string ApiUrl = "https://api.openai.com/v1/responses";
         private const string Model = "gpt-4.1-mini";
-        private const int MaxOutputTokens = 700;
+        private const int ConstrainedMaxOutputTokens = 300;
 
-        // Этот снимок состояния намеренно передается без изменений во всех трех запросах.
+        // Этот снимок состояния намеренно передается без изменений в обоих режимах.
         private const string ModelState = @"Виртуальные данные модели Revit
 
 ДО запуска плагина:
@@ -38,24 +38,15 @@ namespace BimS
 
 Важно: это виртуальные данные; журнал транзакций, исходный код плагина и реальная Revit-модель отсутствуют. Отделяй факты от гипотез и не выдумывай недостающие доказательства.";
 
-        private static readonly PromptCase[] Cases =
-        {
-            new PromptCase(
-                "1. SIMPLE PROMPTING — temperature 0.1",
-                0.1,
-                "",
-                "Сравни состояние модели ДО и ПОСЛЕ и кратко опиши, что произошло, опираясь только на приведенные данные."),
-            new PromptCase(
-                "2. SYSTEM PROMPT — temperature 0.4",
-                0.4,
-                "Ты BIM-координатор. Ты обнаружил неожиданное изменение после работы плагина Revit и пытаешься понять его возможную причину и последствия для модели и документации. Четко разделяй установленные факты, гипотезы и необходимые проверки.",
-                "Проанализируй приведенное состояние модели ДО и ПОСЛЕ. Опиши изменение, возможные причины, последствия для модели и документации, а также необходимые проверки."),
-            new PromptCase(
-                "3. MULTI-PERSPECTIVE PROMPTING — temperature 0.6",
-                0.6,
-                "Исследуй ситуацию последовательно с двух профессиональных точек зрения. Сначала выступи BIM-координатором: исследуй модель физически, установи, почему могло возникнуть неожиданное изменение и к чему оно привело. Затем выступи разработчиком программы Revit: учитывая логику плагинов, предположи, какое действие могло затронуть несвязанную арматуру лестничной площадки. После этого сопоставь обе точки зрения и сформулируй общий вывод. Четко отличай факты от гипотез; отсутствующие сведения не выдумывай.",
-                "Выполни пошаговый анализ приведенного состояния ДО и ПОСЛЕ: 1) взгляд BIM-координатора; 2) взгляд разработчика Revit; 3) сопоставление и общий вывод."),
-        };
+        private const string OriginalPrompt =
+            "Сравни состояние модели ДО и ПОСЛЕ и кратко опиши, что произошло, опираясь только на приведенные данные.";
+
+        private const string ConstrainedInstructions =
+            "Ответь строго одним JSON-объектом ровно с четырьмя строковыми полями: " +
+            "change — что изменилось в модели; consequences — к каким изменениям в спецификации и листе это привело; " +
+            "checks — что необходимо проверить в Revit; conclusion — вывод о характере изменения, неожиданное оно или ожидаемое. " +
+            "Значение каждого поля должно содержать не более одного-двух коротких предложений. " +
+            "Значение поля conclusion должно заканчиваться точной строкой END_BIM_S. После JSON-объекта не выводи ничего.";
 
         private static void Main()
         {
@@ -75,6 +66,19 @@ namespace BimS
 
         private static async Task RunAsync()
         {
+            Console.WriteLine("1 — Без ограничений");
+            Console.WriteLine("2 — С ограничениями");
+            Console.Write("Выберите режим: ");
+            string choice = Console.ReadLine();
+
+            bool constrained;
+            if (choice == "1")
+                constrained = false;
+            else if (choice == "2")
+                constrained = true;
+            else
+                throw new InvalidOperationException("Введите 1 или 2.");
+
             string apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
             if (string.IsNullOrWhiteSpace(apiKey))
                 throw new InvalidOperationException("Переменная среды OPENAI_API_KEY не задана.");
@@ -84,29 +88,36 @@ namespace BimS
                 client.Timeout = TimeSpan.FromMinutes(2);
                 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
 
-                foreach (PromptCase item in Cases)
+                Console.WriteLine();
+                Console.WriteLine(new string('=', 72));
+                Console.WriteLine(constrained ? "2 — С ограничениями" : "1 — Без ограничений");
+                Console.WriteLine(new string('=', 72));
+                if (constrained)
                 {
-                    Console.WriteLine(new string('=', 72));
-                    Console.WriteLine(item.Title);
-                    Console.WriteLine(new string('=', 72));
-                    Console.WriteLine(await AskAsync(client, item));
+                    Console.WriteLine("Примечание: Responses API не поддерживает параметр stop; используется явная инструкция завершения END_BIM_S.");
                     Console.WriteLine();
                 }
+
+                string answer = await AskAsync(client, constrained);
+                Console.WriteLine(constrained ? FormatJsonForConsole(answer) : answer);
             }
         }
 
-        private static async Task<string> AskAsync(HttpClient client, PromptCase prompt)
+        private static async Task<string> AskAsync(HttpClient client, bool constrained)
         {
             var body = new Dictionary<string, object>
             {
                 ["model"] = Model,
-                ["input"] = ModelState + "\n\nЗадание:\n" + prompt.UserPrompt,
-                ["temperature"] = prompt.Temperature,
-                ["max_output_tokens"] = MaxOutputTokens,
+                ["input"] = ModelState + "\n\nЗадание:\n" + OriginalPrompt,
                 ["store"] = false
             };
-            if (!string.IsNullOrEmpty(prompt.Instructions))
-                body["instructions"] = prompt.Instructions;
+
+            if (constrained)
+            {
+                body["instructions"] = ConstrainedInstructions;
+                body["max_output_tokens"] = ConstrainedMaxOutputTokens;
+                body["text"] = CreateJsonOutputFormat();
+            }
 
             var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
             string json = serializer.Serialize(body);
@@ -120,6 +131,74 @@ namespace BimS
 
                 return ExtractOutputText(responseJson);
             }
+        }
+
+        private static Dictionary<string, object> CreateJsonOutputFormat()
+        {
+            var properties = new Dictionary<string, object>
+            {
+                ["change"] = CreateShortStringProperty("Что изменилось в модели."),
+                ["consequences"] = CreateShortStringProperty("К каким изменениям в спецификации и листе это привело."),
+                ["checks"] = CreateShortStringProperty("Что необходимо проверить в Revit."),
+                ["conclusion"] = new Dictionary<string, object>
+                {
+                    ["type"] = "string",
+                    ["description"] = "Одно-два коротких предложения о том, ожидаемое это изменение или неожиданное. Значение должно заканчиваться точной строкой END_BIM_S."
+                }
+            };
+
+            return new Dictionary<string, object>
+            {
+                ["format"] = new Dictionary<string, object>
+                {
+                    ["type"] = "json_schema",
+                    ["name"] = "bim_analysis",
+                    ["strict"] = true,
+                    ["schema"] = new Dictionary<string, object>
+                    {
+                        ["type"] = "object",
+                        ["properties"] = properties,
+                        ["required"] = new[] { "change", "consequences", "checks", "conclusion" },
+                        ["additionalProperties"] = false
+                    }
+                }
+            };
+        }
+
+        private static Dictionary<string, object> CreateShortStringProperty(string meaning)
+        {
+            return new Dictionary<string, object>
+            {
+                ["type"] = "string",
+                ["description"] = meaning + " Не более одного-двух коротких предложений."
+            };
+        }
+
+        private static string FormatJsonForConsole(string json)
+        {
+            var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var data = serializer.DeserializeObject(json) as Dictionary<string, object>;
+            string[] fields = { "change", "consequences", "checks", "conclusion" };
+
+            if (data == null || data.Count != fields.Length)
+                throw new InvalidOperationException("Ответ ограниченного режима не является JSON-объектом с четырьмя полями.");
+
+            var result = new StringBuilder();
+            result.AppendLine("{");
+            for (int index = 0; index < fields.Length; index++)
+            {
+                string field = fields[index];
+                if (!data.TryGetValue(field, out object value) || !(value is string))
+                    throw new InvalidOperationException("В JSON-ответе отсутствует строковое поле " + field + ".");
+
+                result.Append("  ");
+                result.Append(serializer.Serialize(field));
+                result.Append(": ");
+                result.Append(serializer.Serialize(value));
+                result.AppendLine(index < fields.Length - 1 ? "," : "");
+            }
+            result.Append("}");
+            return result.ToString();
         }
 
         private static string ExtractOutputText(string json)
@@ -213,20 +292,5 @@ namespace BimS
             return "подробности ответа не распознаны";
         }
 
-        private sealed class PromptCase
-        {
-            public PromptCase(string title, double temperature, string instructions, string userPrompt)
-            {
-                Title = title;
-                Temperature = temperature;
-                Instructions = instructions;
-                UserPrompt = userPrompt;
-            }
-
-            public string Title { get; }
-            public double Temperature { get; }
-            public string Instructions { get; }
-            public string UserPrompt { get; }
-        }
     }
 }
